@@ -1,12 +1,27 @@
 from __future__ import annotations
-from typing import Literal, TYPE_CHECKING, Optional, Union, List, TypeVar, Any, Iterable, Sequence, cast, Tuple, Dict
+from typing import (
+    Literal,
+    TYPE_CHECKING,
+    Optional,
+    Union,
+    List,
+    TypeVar,
+    Any,
+    Iterable,
+    Sequence,
+    cast,
+    Tuple,
+    Dict,
+    Iterator,
+)
 from itertools import chain
 from dataclasses import dataclass, field
+import re
 
 from dlt.common.utils import digest128
 
 import openapi_schema_pydantic as osp
-from openapi_python_client.parser.types import DataType
+from openapi_python_client.parser.types import DataType, TOpenApiType
 from openapi_python_client.parser.properties.converter import convert
 from openapi_python_client.utils import unique_list
 
@@ -27,8 +42,24 @@ class DataPropertyPath:
     prop: "SchemaWrapper"  # TODO: Why is this not pointing to Property?
 
     @property
+    def name(self) -> str:
+        if self.is_list and self.prop.array_item:
+            return self.prop.array_item.name
+        return self.prop.name
+
+    @property
     def json_path(self) -> str:
         return ".".join(self.path)
+
+    @property
+    def is_list(self) -> bool:
+        return self.prop.is_list
+
+    @property
+    def schema(self) -> "SchemaWrapper":
+        if self.is_list and self.prop.array_item:
+            return self.prop.array_item
+        return self.prop
 
     def __str__(self) -> str:
         return f"DataPropertyPath {self.path}: {self.prop.name}"
@@ -57,16 +88,57 @@ class SchemaWrapper:
     crawled_properties: SchemaCrawler
     hash_key: str
 
+    type_format: Optional[str] = None
+    """Format (e.g. datetime, uuid) as an extension of the data type"""
+
+    maximum: Optional[float] = None
+    """Maximum value for number type if applicable"""
+
     array_item: Optional["SchemaWrapper"] = None
     all_of: List["SchemaWrapper"] = field(default_factory=list)
     any_of: List["SchemaWrapper"] = field(default_factory=list)
     one_of: List["SchemaWrapper"] = field(default_factory=list)
+
+    enum_values: Optional[List[Any]] = None
+    primary_key: Optional[str] = None
+    examples: List[Any] = field(default_factory=list)
 
     def __getitem__(self, item: str) -> "Property":
         try:
             return next(prop for prop in self.properties if prop.name == item)
         except StopIteration:
             raise KeyError(f"No property with name {item} in {self.name}")
+
+    def __contains__(self, item: str) -> bool:
+        return any(prop.name == item for prop in self.properties)
+
+    def __iter__(self) -> Iterable["str"]:
+        return (prop.name for prop in self.properties)
+
+    def _find_primary_key(self) -> Optional[str]:
+        """Attempt to find the name of primary key field in the schema"""
+        # Regex pattern finding the words "unique", "id" or "identifier" in description
+        # Use word boundaries
+        desc_pattern = re.compile(r"\b(unique|id|identifier)\b", re.IGNORECASE)
+
+        description_paths = []
+        uuid_paths = []
+
+        for prop in self.all_properties:
+            if not set(prop.schema.types) & {"string", "integer"}:
+                continue
+            if prop.name.lower() == "id":
+                return prop.name
+            elif prop.schema.description and desc_pattern.search(prop.schema.description):
+                description_paths.append(prop.name)
+            elif prop.schema.type_format == "uuid":
+                uuid_paths.append(prop.name)
+
+        if description_paths:
+            return description_paths[0]
+        elif uuid_paths:
+            return uuid_paths[0]
+        return None
 
     @property
     def has_properties(self) -> bool:
@@ -148,6 +220,12 @@ class SchemaWrapper:
 
         all_of = _remove_nones([cls.from_reference_guarded(ref, context, level=level) for ref in schema.allOf or []])
 
+        if not name:
+            for sub in all_of:
+                name = sub.name
+                if name:
+                    break
+
         # Properties from all_of child schemas should be merged
         property_map = {prop.name: prop for prop in parent_properties or []}
         property_map.update({prop.name: prop for prop in chain.from_iterable(s.properties for s in all_of)})
@@ -193,19 +271,22 @@ class SchemaWrapper:
                 schema_types = [schema.type]
             else:
                 schema_types = schema.type.copy()
-            if "null" in schema_types:
-                nullable = True
-                schema_types.remove("null")
         else:
             schema_types = []  # No types, they may be taken from all_of/one_of/any_of
         for obj in all_of + one_of + any_of:
             schema_types.extend(obj.types)
+            if obj.nullable:
+                nullable = True
+        if "null" in schema_types:
+            nullable = True
+            schema_types.remove("null")
 
         default = schema.default
         # Only do string escaping, other types can go as-is
         if isinstance(default, str):
             default = convert("str", default)
 
+        examples = ([schema.example] if schema.example else schema.examples) or []
         crawler = SchemaCrawler()
         result = cls(
             schema=schema,
@@ -222,7 +303,12 @@ class SchemaWrapper:
             default=default,
             crawled_properties=crawler,
             hash_key=digest128(schema.json(sort_keys=True)),
+            type_format=schema.schema_format,
+            maximum=schema.maximum,
+            enum_values=schema.enum,
+            examples=examples,
         )
+        result.primary_key = result._find_primary_key()
         crawler.crawl(result)
         return result
 
@@ -283,7 +369,39 @@ class SchemaCrawler:
         self.all_properties: Dict[Tuple[str, ...], SchemaWrapper] = {}
         self.required_properties: List[Tuple[str, ...]] = []  # Paths of required properties
 
-    def _is_optional(self, path: Tuple[str, ...]) -> bool:
+    def __getitem__(self, item: Tuple[str, ...]) -> SchemaWrapper:
+        return self.all_properties[item]
+
+    def __contains__(self, item: Tuple[str, ...]) -> bool:
+        return item in self.all_properties
+
+    def __iter__(self) -> Iterable[Tuple[str, ...]]:
+        return iter(self.all_properties.keys())
+
+    def __len__(self) -> int:
+        return len(self.all_properties)
+
+    def __bool__(self) -> bool:
+        return bool(self.all_properties)
+
+    def items(self) -> Iterable[Tuple[Tuple[str, ...], SchemaWrapper]]:
+        return self.all_properties.items()
+
+    def paths_with_types(
+        self,
+    ) -> Iterator[tuple[tuple[str, ...], tuple[tuple[TSchemaType, ...], Optional[str], tuple[Any, ...]]]]:
+        """
+        yields a tuple of (path, ( (types, ...), "format")) for each property in the schema
+        """
+        for path, schema in self.all_properties.items():
+            # if schema.is_list and schema.array_item:
+            #     # Include the array item type for full comparison
+            #     yield path, tuple(schema.types + schema.array_item.types])
+            # else:
+            # yield path, (tuple(schema.types), schema.type_format, tuple(schema.enum_values or []))
+            yield path, (tuple(schema.types), schema.type_format, tuple(schema.enum_values or []))
+
+    def is_optional(self, path: Tuple[str, ...]) -> bool:
         """Check whether the property itself or any of its parents is nullable"""
         check_path = list(path)
         while check_path:
@@ -294,33 +412,77 @@ class SchemaCrawler:
             check_path.pop()
         return False
 
-    def find_property_by_name(self, name: str, fallback: Optional[str] = None) -> Optional[DataPropertyPath]:
-        """Find a property with the given name somewhere in the object tree.
+    def find_property(
+        self, pattern: re.Pattern[str], require_type: Optional[TOpenApiType] = None
+    ) -> Optional[DataPropertyPath]:
+        candidates = []
+        unknown_type_candidates = []
+        for path, schema in self.items():
+            if not path:
+                continue
+            if not pattern.match(path[-1]):
+                continue
+            if require_type:
+                if require_type in schema.types:
+                    candidates.append((path, schema))
+                elif not schema.types:
+                    unknown_type_candidates.append((path, schema))
+            else:
+                candidates.append((path, schema))
 
-        Prefers paths higher up in the object over deeply nested paths.
+        # prefer least nested path
+        candidates.sort(key=lambda item: len(item[0]))
+        unknown_type_candidates.sort(key=lambda item: len(item[0]))
 
-        Args:
-            name: The name of the property to look for
-            fallback: Optional fallback property to get when `name` is not found
-
-        Returns:
-            If property is found, `DataPropertyPath` object containing the corresponding schema and path tuple/json path
-        """
-        named = []
-        fallbacks = []
-        for path, prop in self.all_properties.items():
-            if name in path and not self._is_optional(path):
-                named.append((path, prop))
-            if fallback and fallback in path and not self._is_optional(path):
-                fallbacks.append((path, prop))
-        # Prefer the least nested path
-        named.sort(key=lambda item: len(item[0]))
-        fallbacks.sort(key=lambda item: len(item[0]))
-        if named:
-            return DataPropertyPath(*named[0])
-        elif fallbacks:
-            return DataPropertyPath(*fallbacks[0])
+        if candidates:
+            return DataPropertyPath(*candidates[0])
+        elif unknown_type_candidates:
+            return DataPropertyPath(*unknown_type_candidates[0])
         return None
+
+    # def find_property_by_name(self, name: str, fallback: Optional[str] = None) -> Optional[DataPropertyPath]:
+    #     """Find a property with the given name somewhere in the object tree.
+
+    #     Prefers paths higher up in the object over deeply nested paths.
+
+    #     Args:
+    #         name: The name of the property to look for
+    #         fallback: Optional fallback property to get when `name` is not found
+
+    #     Returns:
+    #         If property is found, `DataPropertyPath` object containing the corresponding schema and path tuple/json path
+    #     """
+    #     named = []
+    #     fallbacks = []
+    #     named_optional = []
+    #     fallbacks_optional = []
+    #     for path, prop in self.all_properties.items():
+    #         if name in path:
+    #             if self._is_optional(path):
+    #                 named_optional.append((path, prop))
+    #             else:
+    #                 named.append((path, prop))
+    #         if fallback and fallback in path:
+    #             if self._is_optional(path):
+    #                 fallbacks_optional.append((path, prop))
+    #             else:
+    #                 fallbacks.append((path, prop))
+    #     # Prefer the least nested path
+    #     named.sort(key=lambda item: len(item[0]))
+    #     fallbacks.sort(key=lambda item: len(item[0]))
+    #     named_optional.sort(key=lambda item: len(item[0]))
+    #     fallbacks_optional.sort(key=lambda item: len(item[0]))
+    #     # Prefer required property and required fallback over optional properties
+    #     # If not required props found, assume the spec is wrong and optional properties are required in practice
+    #     if named:
+    #         return DataPropertyPath(*named[0])
+    #     elif fallbacks:
+    #         return DataPropertyPath(*fallbacks[0])
+    #     elif named_optional:
+    #         return DataPropertyPath(*named_optional[0])
+    #     elif fallbacks_optional:
+    #         return DataPropertyPath(*fallbacks_optional[0])
+    #     return None
 
     def crawl(self, schema: SchemaWrapper, path: Tuple[str, ...] = ()) -> None:
         self.all_properties[path] = schema

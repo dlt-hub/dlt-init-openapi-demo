@@ -14,7 +14,7 @@ include = ["CHANGELOG.md", "{{ package_name }}/py.typed"]
 
 [tool.poetry.dependencies]
 python = "^3.8"
-dlt = "^0.2.6"
+dlt = {extras = ["duckdb"], version = "^0.4.8"}
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]

@@ -53,65 +53,49 @@ params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
 {% endmacro %}
 
 
-{# The all the kwargs passed into an endpoint (and variants thereof)) #}
-{% macro arguments(endpoint) %}
-rest_client: RESTClient,
-{% for parameter in endpoint.required_parameters.values() %}
-{{ parameter.to_string() }},
-{% endfor %}
-{% for parameter in endpoint.optional_parameters.values() %}
-{{ parameter.to_string() }},
-{% endfor %}
-{# Security #}
-{% if endpoint.credentials_parameter %}
-{{ endpoint.credentials_parameter.to_string('dlt.secrets.value') }},
-{% endif %}
-{% endmacro %}
-
+{# Resource function signature #}
 {% macro resource_arguments(endpoint) %}
 {% if endpoint.transformer %}
 data: Any,
-rest_client: RESTClient,
-{% else %}
-rest_client: RESTClient,
-{% for parameter in endpoint.required_parameters.values() %}
-{{ parameter.to_string() }},
-{% endfor %}
 {% endif %}
-{% for parameter in endpoint.optional_parameters.values() %}
+rest_client: RESTClient,
+{# Positional arguments #}
+{% for parameter in endpoint.positional_arguments() %}
 {{ parameter.to_string() }},
 {% endfor %}
-base_url: str = dlt.config.value,
 {# Security #}
 {% if endpoint.credentials %}
 credentials: {{ endpoint.credentials.type_hint }} = dlt.secrets.value,
 {% endif %}
 data_json_path: Optional[str]="{{endpoint.data_json_path}}",
 {% if endpoint.transformer %}
-parent_property_path: str="{{ endpoint.transformer.parent_property.json_path }}",
-path_parameter_name: str="{{ endpoint.transformer.path_parameter.name }}",
+{# Render the dict of path params #}
+path_parameter_paths: Dict[str, TJsonPath]={{ endpoint.transformer.path_params_mapping }},
 {% endif %}
+{# Keyword arguments #}
+{% for parameter in endpoint.keyword_arguments() %}
+{{ parameter.to_string() }},
+{% endfor %}
 {% endmacro %}
 
 {# Just lists all kwargs to endpoints as name=name for passing to other functions #}
 {% macro kwargs(endpoint) %}
-{% for parameter in endpoint.required_parameters.values() %}
-{{ parameter.python_name }}={{ parameter.python_name }},    
+{% for parameter in endpoint.all_arguments() %}
+{{ parameter.python_name }}={{ parameter.python_name }},
 {% endfor %}
-{% for parameter in endpoint.optional_parameters.values() %}
-{{ parameter.python_name }}={{ parameter.python_name }},    
-{% endfor %}    
 {% endmacro %}
 
 {% macro transformer_kwargs(endpoint) %}
 {#{% for parameter in endpoint.required_parameters.values() %} #}
 {#{{ parameter.python_name }}={{ parameter.python_name }},    #]
 {#{% endfor %} #}
-{% for parameter in endpoint.optional_parameters.values() %}
-{{ parameter.python_name }}={{ parameter.python_name }},    
+{% for parameter in endpoint.all_arguments() %}
+{{ parameter.python_name }}={{ parameter.python_name }},
 {% endfor %}
 {% endmacro %}
 
+
+{# Docstring #}
 {% macro docstring_content(endpoint, return_string, is_detailed) %}
 {% if endpoint.summary %}{{ endpoint.summary | wordwrap(100)}}
 
@@ -127,7 +111,7 @@ Parent endpoint: {{ endpoint.parent.path }}
 {# Leave extra space so that Args or Returns isn't at the top #}
 
 {% endif %}
-{% set all_parameters = endpoint.list_all_parameters %}
+{% set all_parameters = endpoint.all_arguments() %}
 {% if all_parameters %}
 Args:
     {% for parameter in all_parameters %}
@@ -141,4 +125,13 @@ Returns:
 
 {% macro docstring(endpoint, return_string, is_detailed) %}
 {{ safe_docstring(docstring_content(endpoint, return_string, is_detailed)) }}
+{% endmacro %}
+
+
+{% macro paginator(endpoint) %}
+{% if endpoint.pagination %}
+{{ endpoint.pagination.to_string() }}
+{% else %}
+None
+{% endif %}
 {% endmacro %}

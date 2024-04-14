@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, TYPE_CHECKING, Dict
+from typing import Literal, TYPE_CHECKING, Dict, Optional, List
 
 if TYPE_CHECKING:
     from openapi_python_client.parser.models import SchemaWrapper, Property
@@ -28,8 +28,8 @@ def schema_to_type_hint(schema: SchemaWrapper, required: bool = True) -> str:
             item_type = schema_to_type_hint(schema.array_item)
             py_type = f"List[{item_type}]"
             union_types[py_type] = None
-    for one_of in schema.one_of + schema.any_of:
-        union_types[schema_to_type_hint(one_of)] = None
+    # for one_of in schema.one_of + schema.any_of:  # all these are already included in top level schema
+    #     union_types[schema_to_type_hint(one_of)] = None
 
     final_type = ""
     if len(union_types) == 1:
@@ -54,3 +54,17 @@ class DataType:
         """Create a DataType from a Property.
         Properties may be required or not, so we need to pass that information."""
         return cls(type_hint=schema_to_type_hint(prop.schema, required=prop.required))
+
+
+def compare_openapi_types(
+    types: List[TOpenApiType], type_format: Optional[str], other_types: List[TOpenApiType], other_format: Optional[str]
+) -> bool:
+    types = sorted(types)
+    other_types = sorted(other_types)
+    if types == other_types:
+        if type_format == other_format:
+            return True
+        elif None in (type_format, other_format):
+            # One side has format unset, assume it's equivalent
+            return True
+    return False
